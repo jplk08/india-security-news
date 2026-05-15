@@ -1,5 +1,6 @@
 feedparser
 requests
 reportlab
-google-generativeai
+google-genai
 newsapi-python
+python-dotenv

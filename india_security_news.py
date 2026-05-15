@@ -8,18 +8,20 @@ Sources: Google News RSS, NewsAPI (free tier), BBC/Reuters/ToI/HT/Hindu/NDTV/IE
 Output:  india_security_YYYY-MM-DD.pdf
 
 Requirements:
-    pip install feedparser requests reportlab google-generativeai newsapi-python
+    pip install feedparser requests reportlab google-genai newsapi-python python-dotenv
 
 Setup:
-    1. Gemini API key is pre-configured below (free tier from Google AI Studio)
-    2. Get a FREE NewsAPI key at https://newsapi.org/register and paste into NEWSAPI_KEY
+    Copy .env.example to .env and fill in your API keys.
 """
 
 import os
 import re
+import sys
+import time
 import feedparser
 import requests
-import time
+from io import BytesIO
+from xml.sax.saxutils import escape as xml_escape
 from google import genai
 from google.genai import errors as genai_errors
 from datetime import datetime, date, timedelta, timezone
@@ -32,18 +34,41 @@ from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
 from reportlab.lib.enums import TA_JUSTIFY, TA_CENTER
 
+# Load .env file if python-dotenv is available
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 # ─────────────────────────────────────────────
-# CONFIGURATION — edit these values
+# CONFIGURATION
 # ─────────────────────────────────────────────
-NEWSAPI_KEY = "5e956655bf3f44bbab3455fb3771b758"
-GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "***REDACTED***")
-OUTPUT_DIR  = "."
+NEWSAPI_KEY = os.environ.get("NEWSAPI_KEY", "")
+GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "")
+OUTPUT_DIR  = os.environ.get("OUTPUT_DIR", ".")
+
+# Validate OUTPUT_DIR
+if not os.path.isdir(OUTPUT_DIR):
+    print(f"[!] OUTPUT_DIR '{OUTPUT_DIR}' does not exist. Using current directory.")
+    OUTPUT_DIR = "."
+
+# Validate required keys
+if not GEMINI_KEY:
+    print("[!] GEMINI_API_KEY is not set. Add it to your .env file or set the environment variable.")
+    sys.exit(1)
 
 # Configure Gemini client
 _gemini_client = genai.Client(api_key=GEMINI_KEY)
 GEMINI_MODELS  = ["models/gemini-2.5-flash", "models/gemini-2.0-flash", "models/gemini-2.0-flash-lite"]
 
+RSS_FETCH_TIMEOUT = 15   # seconds per RSS feed request
+RSS_MAX_BYTES     = 5 * 1024 * 1024  # 5 MB max per feed response
 
+
+# ─────────────────────────────────────────────
+# GEMINI HELPER
+# ─────────────────────────────────────────────
 def _gemini_generate(prompt: str) -> str:
     """Call Gemini with automatic model fallback and retry on rate-limit/overload."""
     for model in GEMINI_MODELS:
@@ -53,17 +78,19 @@ def _gemini_generate(prompt: str) -> str:
                 return response.text.strip()
             except (genai_errors.ClientError, genai_errors.ServerError) as e:
                 err = str(e)
-                if "429" in err or "RESOURCE_EXHAUSTED" in err or "503" in err or "UNAVAILABLE" in err:
+                if "403" in err or "PERMISSION_DENIED" in err or "leaked" in err.lower():
+                    raise RuntimeError(
+                        "Gemini API key is invalid or has been flagged as leaked. "
+                        "Generate a new key at aistudio.google.com."
+                    )
+                if any(x in err for x in ("429", "RESOURCE_EXHAUSTED", "503", "UNAVAILABLE")):
                     wait = 20 * (attempt + 1)
                     print(f"  [Gemini] Transient error on {model}, retrying in {wait}s (attempt {attempt+1}/3)...")
                     time.sleep(wait)
                 else:
-                    print(f"  [Gemini] Error on {model}: {e}. Trying next model...")
-                    break
-        else:
-            continue
-        break
-    raise RuntimeError("All Gemini models exhausted. Check your API key quota.")
+                    print(f"  [Gemini] Error on {model} ({type(e).__name__}). Trying next model...")
+                    break  # exits attempt loop → outer loop continues to next model
+    raise RuntimeError("All Gemini models exhausted. Check your API key and quota.")
 
 
 # ─────────────────────────────────────────────
@@ -109,7 +136,20 @@ RSS_FEEDS = {
 # ─────────────────────────────────────────────
 # STEP 1 — FETCH ARTICLES
 # ─────────────────────────────────────────────
-def fetch_rss_articles():
+def _fetch_feed_with_timeout(url: str) -> feedparser.FeedParserDict:
+    """Fetch RSS feed via requests (with timeout + size cap) then parse."""
+    resp = requests.get(
+        url,
+        timeout=RSS_FETCH_TIMEOUT,
+        headers={"User-Agent": "IndiaSecurityNewsBot/1.0"},
+        stream=True,
+    )
+    resp.raise_for_status()
+    raw = resp.raw.read(RSS_MAX_BYTES)
+    return feedparser.parse(BytesIO(raw))
+
+
+def fetch_rss_articles() -> list:
     """Fetch articles from all RSS feeds published in the last 7 days."""
     articles = []
     seen_titles = set()
@@ -117,7 +157,7 @@ def fetch_rss_articles():
 
     for source_name, url in RSS_FEEDS.items():
         try:
-            feed = feedparser.parse(url)
+            feed = _fetch_feed_with_timeout(url)
             for entry in feed.entries[:20]:
                 title   = entry.get("title", "").strip()
                 summary = entry.get("summary", entry.get("description", "")).strip()
@@ -137,20 +177,24 @@ def fetch_rss_articles():
                     seen_titles.add(title)
                     articles.append({
                         "source": source_name,
-                        "title":  title,
-                        "text":   clean_html(summary),
-                        "url":    link,
+                        "title":  sanitize_text(title),
+                        "text":   sanitize_text(clean_html(summary)),
+                        "url":    sanitize_url(link),
                     })
+        except requests.exceptions.Timeout:
+            print(f"  [RSS] Timeout fetching {source_name} — skipping.")
+        except requests.exceptions.RequestException as e:
+            print(f"  [RSS] Could not fetch {source_name}: {type(e).__name__}")
         except Exception as e:
-            print(f"  [RSS] Could not fetch {source_name}: {e}")
+            print(f"  [RSS] Parse error for {source_name}: {type(e).__name__}")
 
     return articles
 
 
-def fetch_newsapi_articles():
+def fetch_newsapi_articles() -> list:
     """Fetch articles from NewsAPI free tier."""
-    if not NEWSAPI_KEY or NEWSAPI_KEY == "YOUR_NEWSAPI_KEY_HERE":
-        print("  [NewsAPI] Skipping — no API key configured.")
+    if not NEWSAPI_KEY:
+        print("  [NewsAPI] Skipping — NEWSAPI_KEY not set in .env.")
         return []
 
     articles = []
@@ -159,13 +203,19 @@ def fetch_newsapi_articles():
 
     for keyword in SECURITY_KEYWORDS[:5]:
         try:
-            url = (
-                "https://newsapi.org/v2/everything"
-                f"?q={requests.utils.quote(keyword)}"
-                f"&from={seven_days_ago}&sortBy=publishedAt&language=en"
-                f"&apiKey={NEWSAPI_KEY}&pageSize=5"
+            resp = requests.get(
+                "https://newsapi.org/v2/everything",
+                headers={"X-Api-Key": NEWSAPI_KEY},   # key in header, not URL
+                params={
+                    "q":        keyword,
+                    "from":     seven_days_ago,
+                    "sortBy":   "publishedAt",
+                    "language": "en",
+                    "pageSize": 5,
+                },
+                timeout=10,
             )
-            resp = requests.get(url, timeout=10)
+            resp.raise_for_status()
             data = resp.json()
 
             for item in data.get("articles", []):
@@ -181,13 +231,15 @@ def fetch_newsapi_articles():
                 if is_security_relevant(combined):
                     seen_titles.add(title)
                     articles.append({
-                        "source": source,
-                        "title":  title,
-                        "text":   clean_html(content),
-                        "url":    link,
+                        "source": sanitize_text(source),
+                        "title":  sanitize_text(title),
+                        "text":   sanitize_text(clean_html(content)),
+                        "url":    sanitize_url(link),
                     })
-        except Exception as e:
-            print(f"  [NewsAPI] Error for '{keyword}': {e}")
+        except requests.exceptions.RequestException as e:
+            print(f"  [NewsAPI] Request error for '{keyword}': {type(e).__name__}")
+        except (KeyError, ValueError) as e:
+            print(f"  [NewsAPI] Parse error for '{keyword}': {type(e).__name__}")
 
     return articles
 
@@ -213,8 +265,8 @@ NON_SECURITY_TERMS = [
     "stock market", "sensex", "nifty", "share price", "mutual fund",
 ]
 
+
 def is_security_relevant(text: str) -> bool:
-    """Return True only if text is clearly India-security-relevant."""
     text = text.lower()
     if any(term in text for term in NON_SECURITY_TERMS):
         return False
@@ -224,9 +276,22 @@ def is_security_relevant(text: str) -> bool:
 
 
 def clean_html(text: str) -> str:
+    """Strip HTML tags and normalize whitespace."""
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
+
+
+def sanitize_text(text: str) -> str:
+    """Escape XML/ReportLab markup characters in external content."""
+    return xml_escape(text)
+
+
+def sanitize_url(url: str) -> str:
+    """Accept only http/https URLs; return empty string otherwise."""
+    if url and re.match(r"^https?://", url.strip()):
+        return url.strip()
+    return ""
 
 
 # ─────────────────────────────────────────────
@@ -265,7 +330,7 @@ def summarize_with_gemini(articles: list) -> str:
 # ─────────────────────────────────────────────
 def review_with_gemini(draft: str, articles: list) -> tuple:
     """
-    Senior editor pass: improves the draft summary and extracts key developments.
+    Senior editor pass: improves the draft and extracts key developments.
     Returns (improved_summary: str, key_developments: list[str]).
     """
     headlines = "\n".join(
@@ -302,9 +367,9 @@ def _parse_review_response(raw: str, fallback: str) -> tuple:
 
     try:
         if "SUMMARY:" in raw and "KEY_DEVELOPMENTS:" in raw:
-            parts        = raw.split("KEY_DEVELOPMENTS:")
-            summary      = parts[0].replace("SUMMARY:", "").strip()
-            key_devs     = [
+            parts    = raw.split("KEY_DEVELOPMENTS:")
+            summary  = parts[0].replace("SUMMARY:", "").strip()
+            key_devs = [
                 line.lstrip("•-– ").strip()
                 for line in parts[1].splitlines()
                 if line.strip()
@@ -333,7 +398,7 @@ def build_source_list(articles: list) -> list:
 # ─────────────────────────────────────────────
 # STEP 6 — GENERATE PDF
 # ─────────────────────────────────────────────
-def generate_pdf(summary: str, key_devs: list, sources: list, article_count: int):
+def generate_pdf(summary: str, key_devs: list, sources: list, article_count: int) -> str:
     today_str    = date.today().strftime("%Y-%m-%d")
     display_date = date.today().strftime("%B %d, %Y")
     filename     = os.path.join(OUTPUT_DIR, f"india_security_{today_str}.pdf")
@@ -367,44 +432,40 @@ def generate_pdf(summary: str, key_devs: list, sources: list, article_count: int
 
     story = []
 
-    # Header
-    story.append(Paragraph("🇮🇳  India National Security Digest", title_style))
-    story.append(Paragraph("Daily Threat & Security Intelligence Summary", subtitle_style))
+    story.append(Paragraph("India National Security Digest", title_style))
+    story.append(Paragraph("Daily Threat &amp; Security Intelligence Summary", subtitle_style))
     story.append(Paragraph(
         f"Report Date: {display_date}  |  Articles Analyzed: {article_count}  |  "
-        "AI-Reviewed by Google Gemini (gemini-2.0-flash)",
+        "AI-Reviewed by Google Gemini",
         meta_style
     ))
     story.append(HRFlowable(width="100%", thickness=2, color=colors.HexColor("#1a237e"), spaceAfter=10))
 
-    # Key Developments
     if key_devs:
         story.append(Paragraph("KEY DEVELOPMENTS", section_header_style))
         story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#e0e0e0"), spaceAfter=8))
         for dev in key_devs:
-            story.append(Paragraph(f"• {dev}", bullet_style))
+            story.append(Paragraph(f"• {xml_escape(dev)}", bullet_style))
         story.append(Spacer(1, 0.3*cm))
 
-    # Executive Summary
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#e0e0e0"), spaceAfter=8))
     story.append(Paragraph("EXECUTIVE SUMMARY", section_header_style))
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#e0e0e0"), spaceAfter=8))
 
     words = summary.split()
     for i in range(0, len(words), 100):
-        story.append(Paragraph(" ".join(words[i:i+100]), body_style))
+        story.append(Paragraph(xml_escape(" ".join(words[i:i+100])), body_style))
 
     story.append(Spacer(1, 0.4*cm))
 
-    # Sources
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#e0e0e0"), spaceAfter=8))
     story.append(Paragraph("NEWS SOURCES REFERENCED", section_header_style))
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#e0e0e0"), spaceAfter=8))
     for i, (src, title, url) in enumerate(sources, 1):
-        label = f"{i}. [{src}]  {title[:110]}{'...' if len(title) > 110 else ''}"
+        display_title = title[:110] + ("..." if len(title) > 110 else "")
+        label = f"{i}. [{xml_escape(src)}]  {xml_escape(display_title)}"
         story.append(Paragraph(label, source_label_style))
 
-    # Footer
     story.append(Spacer(1, 0.5*cm))
     story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#e0e0e0")))
     story.append(Paragraph(

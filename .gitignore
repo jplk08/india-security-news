@@ -1,6 +1,9 @@
 # Generated PDF reports
 *.pdf
 
+# Secrets — never commit
+.env
+
 # Python
 __pycache__/
 *.pyc
