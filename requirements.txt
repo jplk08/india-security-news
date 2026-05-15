@@ -4,3 +4,4 @@ reportlab
 google-genai
 newsapi-python
 python-dotenv
+pytest
