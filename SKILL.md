@@ -2,27 +2,28 @@
 name: india-security-news
 description: >
   Generates a daily India national security and threat intelligence digest by
-  fetching news from multiple sources (Google News RSS, NewsAPI, BBC, Reuters,
-  Times of India, The Hindu, Hindustan Times), filtering for India-relevant
-  threat/security content from the last 7 days, summarizing with Claude AI into
-  a clean 300-400 word executive summary, reviewing and improving with a Claude
-  editor pass, and saving as a dated PDF report. Use this skill whenever the
-  user asks to: fetch/generate a security news digest for India, build or run a
-  daily news summarizer, create a threat intelligence report, automate India
-  security news collection, or mentions keywords like "daily news PDF", "India
-  threat summary", "security digest", "news automation script", or "summarize
-  security articles". Also trigger when the user wants to modify, extend, or
-  re-run this workflow (e.g. add email delivery, change sources, adjust word
-  count, change output format).
+  fetching news from multiple sources (Google News RSS × 6, BBC, Reuters, Times of
+  India, The Hindu, Hindustan Times, NDTV, Indian Express, NewsAPI), filtering for
+  India-relevant threat/security content from the last 7 days, summarising with
+  Google Gemini AI into a clean 300-400 word executive summary, reviewing and
+  improving with a Gemini editor pass, and saving as a dated A4 PDF report.
+  Use this skill whenever the user asks to: fetch/generate a security news digest
+  for India, build or run a daily news summariser, create a threat intelligence
+  report, automate India security news collection, or mentions keywords like
+  "daily news PDF", "India threat summary", "security digest", "news automation
+  script", or "summarise security articles". Also trigger when the user wants to
+  modify, extend, or re-run this workflow (e.g. add email delivery, change sources,
+  adjust word count, change output format, add new keywords).
 ---
 
 # India National Security News Summarizer
 
 ## Overview
 
-This skill produces a daily PDF digest of India national security and threat
-news. Summarization and content review are both performed by Claude AI
-(claude-sonnet-4-6), producing a high-quality, factual intelligence briefing.
+This skill produces a daily PDF digest of India national security and threat news.
+Summarisation and content review are both performed by **Google Gemini AI**
+(`gemini-2.5-flash` with fallback to `gemini-2.0-flash` and `gemini-2.0-flash-lite`),
+producing a high-quality, factual intelligence briefing.
 News is limited to the **last 7 days** to ensure relevance.
 
 ---
@@ -30,38 +31,71 @@ News is limited to the **last 7 days** to ensure relevance.
 ## Architecture
 
 ```
-[RSS Feeds]  +  [NewsAPI]
-      │               │
-      ▼               ▼
-  fetch_rss_articles()   fetch_newsapi_articles()
-           │
-           ▼
-    is_security_relevant()   ← keyword filter + negative filter (sport/entertainment)
-    date filter (last 7 days)
-    threshold: ≥3 THREAT_TERMS
-           │
-           ▼
-    summarize_with_claude()  ← Claude (claude-sonnet-4-6) intelligence analyst pass
-           │                    → 300-400 word draft executive summary
-           ▼
-    review_with_claude()     ← Claude (claude-sonnet-4-6) senior editor pass
-           │                    → improved summary + KEY_DEVELOPMENTS bullet list
-           ▼
-    generate_pdf()           ← reportlab A4 PDF
-           │                    sections: Key Developments, Executive Summary, Sources
-           ▼
-  india_security_YYYY-MM-DD.pdf
+[RSS Feeds × 13]  +  [NewsAPI]
+        │                 │
+        ▼                 ▼
+fetch_rss_articles(seen)   fetch_newsapi_articles(seen)
+        │                         │
+        └──────────┬──────────────┘
+                   │  shared seen_titles set
+                   │  (cross-source deduplication)
+                   ▼
+         is_security_relevant()   ← keyword filter + negative filter
+         date filter (last 7 days)
+         threshold: ≥3 THREAT_TERMS + India context
+                   │
+                   ▼ (capped at MAX_CORPUS_ARTICLES = 50)
+         summarize_with_gemini()  ← Gemini analyst pass
+                   │                → 300-400 word draft executive summary
+                   ▼
+         review_with_gemini()     ← Gemini senior editor pass
+                   │                → improved summary + KEY_DEVELOPMENTS bullets
+                   ▼
+         generate_pdf()           ← reportlab A4 PDF
+                   │                sections: Key Developments, Executive Summary, Sources
+                   ▼
+       india_security_YYYY-MM-DD.pdf
 ```
+
+If either Gemini call fails (quota, deadline, network), `main.py` catches the
+exception and generates a fallback PDF listing all collected articles without
+an AI summary — the pipeline never crashes without output.
 
 ---
 
-## Configuration (top of script)
+## Module Map
 
-| Variable         | Default                          | Purpose                              |
-|------------------|----------------------------------|--------------------------------------|
-| `NEWSAPI_KEY`    | *(your key)*                     | Free key from newsapi.org/register   |
-| `ANTHROPIC_KEY`  | reads `ANTHROPIC_API_KEY` env var| Anthropic API key for Claude          |
-| `OUTPUT_DIR`     | `.` (current folder)             | Where the PDF is saved               |
+| File | Responsibility |
+|------|----------------|
+| `config.py` | All constants and environment variables (single source of truth) |
+| `models.py` | `Article` dataclass — shared data model across all modules |
+| `filters.py` | `is_security_relevant()`, `clean_html()` (with html.unescape), sanitize helpers |
+| `fetchers.py` | `fetch_rss_articles()`, `fetch_newsapi_articles()` — accept shared `seen_titles` set |
+| `ai.py` | `_gemini_generate()`, `summarize_with_gemini()`, `review_with_gemini()` |
+| `pdf_generator.py` | `build_source_list()`, `generate_pdf()` |
+| `main.py` | Pipeline orchestration, logging setup, error recovery |
+
+---
+
+## Configuration (`config.py`)
+
+| Constant | Default | Purpose |
+|----------|---------|---------|
+| `GEMINI_KEY` | `$GEMINI_API_KEY` env | Google Gemini API key |
+| `NEWSAPI_KEY` | `$NEWSAPI_KEY` env | NewsAPI key (optional) |
+| `OUTPUT_DIR` | `$OUTPUT_DIR` env / `.` | Folder where PDF is saved |
+| `GEMINI_MODELS` | `[gemini-2.5-flash, 2.0-flash, 2.0-flash-lite]` | Tried in order on error |
+| `GEMINI_DEADLINE_SECS` | `120` | Max seconds for summarise + review combined |
+| `GEMINI_MAX_RETRIES` | `3` | Retry attempts per model on 429/503 |
+| `GEMINI_RETRY_DELAY_SECS` | `20` | Base delay (multiplied by attempt number) |
+| `MAX_CORPUS_ARTICLES` | `50` | Articles sent to Gemini (capped to control token budget) |
+| `LOOKBACK_DAYS` | `7` | How far back articles are accepted |
+| `MAX_SOURCES_IN_PDF` | `25` | Source entries in the PDF footer section |
+| `RSS_TIMEOUT_SECS` | `10` | Per-feed HTTP timeout |
+| `MAX_RSS_BYTES` | `2 MB` | Per-feed response size cap |
+| `REQUEST_TIMEOUT_SECS` | `10` | NewsAPI HTTP timeout |
+
+All keys are read from a `.env` file via `python-dotenv`. Never hardcode secrets.
 
 ---
 
@@ -75,75 +109,79 @@ News is limited to the **last 7 days** to ensure relevance.
 - Hindustan Times India News
 - The Hindu National
 - NDTV India
-- Indian Express India
+- Indian Express
 
 ### NewsAPI (free tier — 100 req/day)
-- Queries 5 of the 13 `SECURITY_KEYWORDS` per run
+- Queries up to `MAX_NEWSAPI_KEYWORDS = 5` of the 13 `SECURITY_KEYWORDS` per run
 - Uses last 7 days as `from` date
-- Skipped gracefully if key not configured
+- Skipped gracefully if `NEWSAPI_KEY` not set
 
 ---
 
-## Date Filtering
-
-All articles are filtered to the **last 7 days**:
-- RSS: uses `published_parsed` / `updated_parsed` from feed entries; articles without a date are included (some feeds omit it)
-- NewsAPI: `from` parameter set to `today - 7 days`
-
----
-
-## Filtering Logic
+## Filtering Logic (`filters.py`)
 
 An article is kept only if **all** conditions are true:
 1. Does **not** match any `NON_SECURITY_TERMS` (cricket, Bollywood, stock market, etc.)
-2. Contains `"india"` or `"indian"` in title+summary
-3. Matches **≥ 3** terms from the `THREAT_TERMS` list (covers: threat, attack,
-   security, military, border, terror, cyber, nuclear, espionage, army, blast, drone, etc.)
+2. Contains `"india"` or `"indian"` in title + summary
+3. Matches **≥3** terms from `THREAT_TERMS`
+   (covers: threat, attack, security, military, border, terror, cyber, nuclear,
+   espionage, army, blast, drone, etc.)
+
+`clean_html()` strips tags, decodes HTML entities (including numeric `&#39;` and hex
+`&#x2019;` forms via `html.unescape`), and normalises whitespace.
 
 ---
 
-## Summarization — Claude AI
+## Deduplication (`fetchers.py`)
 
-`summarize_articles()` sends all article titles and snippets to
-`claude-sonnet-4-6` with an intelligence-analyst prompt:
-
-- Produces a 300-400 word flowing executive summary
-- Focuses on significant threats, key actors, geographic hotspots, and implications
-- Professional intelligence-briefing tone, no bullet points
+Both `fetch_rss_articles` and `fetch_newsapi_articles` accept a single `seen_titles: set[str]`
+argument passed from `main.py`. A title added by the RSS fetcher will not be added again
+by the NewsAPI fetcher, preventing the same story from appearing twice in the corpus or PDF.
 
 ---
 
-## Review Pass — Claude AI
+## AI Pipeline (`ai.py`)
 
-`review_summary()` sends the draft summary + all source headlines to
-`claude-sonnet-4-6` acting as a senior intelligence editor:
+### `_gemini_generate(prompt, deadline_end)`
+- Tries each model in `GEMINI_MODELS` in order
+- On `429 RESOURCE_EXHAUSTED` or `503 UNAVAILABLE`: sleeps and retries (up to `GEMINI_MAX_RETRIES` per model), then re-checks the deadline
+- On `403 PERMISSION_DENIED` / leaked key: raises immediately with an actionable message
+- `deadline_end` (from `time.monotonic()`) is checked before each attempt AND after each sleep, so the deadline is honoured even during backoff waits
 
-- Checks accuracy against source headlines
-- Flags missing major stories
-- Improves clarity and professional tone
-- Returns only the final improved summary (no commentary)
+### `summarize_with_gemini(articles, deadline_end)`
+- Slices `articles[:MAX_CORPUS_ARTICLES]` before building the prompt corpus
+- Instructs Gemini to write a 300-400 word flowing executive summary (no bullet points)
+
+### `review_with_gemini(draft, articles, deadline_end)`
+- Provides the draft + source headlines to a "senior editor" prompt
+- Expects strict format: `SUMMARY:\n...\n\nKEY_DEVELOPMENTS:\n• ...\n• ...`
+- `_parse_review_response()` logs a `WARNING` if the expected format is not found before falling back to the raw draft
 
 ---
 
-## PDF Output Structure
+## PDF Output (`pdf_generator.py`)
 
 ```
 ┌─────────────────────────────────────────────┐
-│  🇮🇳  India National Security Digest         │  ← Title (dark blue)
-│  Daily Threat & Security Intelligence Summary │
-│  Report Date: May 14, 2026 | Articles: 43    │
+│    India National Security Digest            │  ← Title (dark blue #1a237e)
+│    Daily Threat & Security Intelligence      │
+│    Summary Report Date: May 15, 2026         │
 ├─────────────────────────────────────────────┤
-│  EXECUTIVE SUMMARY                           │  ← Section (red)
-│                                             │
-│  [300-400 word reviewed paragraph...]       │
-│                                             │
+│  KEY DEVELOPMENTS             (red header)   │
+│  • Development 1                             │
+│  • Development 2 ... (4-6 items)             │
 ├─────────────────────────────────────────────┤
-│  NEWS SOURCES REFERENCED                    │  ← Up to 20 sources
-│  1. [BBC]  India border tensions...         │
-│  2. [Reuters]  Army deploys...              │
-│  ...                                        │
+│  EXECUTIVE SUMMARY            (red header)   │
+│                                              │
+│  [300-400 word justified paragraph...]       │
+│                                              │
 ├─────────────────────────────────────────────┤
-│  Auto-generated footer                      │
+│  NEWS SOURCES REFERENCED      (red header)   │
+│  1. [BBC]  India border tensions...          │
+│  2. [Reuters]  Army deploys...               │
+│  ... up to 25 sources                        │
+├─────────────────────────────────────────────┤
+│  Auto-generated footer (grey)                │
 └─────────────────────────────────────────────┘
 ```
 
@@ -153,85 +191,88 @@ An article is kept only if **all** conditions are true:
 
 ### One-time setup
 ```bash
-pip install feedparser requests reportlab anthropic newsapi-python
+pip install -r requirements.txt
 ```
 
-> `sumy`, `nltk`, and `numpy` are no longer required — summarization is fully handled by Claude.
-
-Set your Anthropic API key:
-```bash
-# Windows (PowerShell)
-$env:ANTHROPIC_API_KEY = "sk-ant-..."
-
-# Or paste directly into ANTHROPIC_KEY in the script
+Create `.env` in the project root:
 ```
-
-Get a free NewsAPI key: https://newsapi.org/register
-Paste it into `NEWSAPI_KEY` in the script.
+GEMINI_API_KEY=your_gemini_key    # aistudio.google.com → Get API Key
+NEWSAPI_KEY=your_newsapi_key      # newsapi.org/register (optional)
+```
 
 ### Run manually
 ```bash
-python india_security_news.py
+python main.py
 ```
 
-### Automate daily
+### Run tests
+```bash
+python -m pytest tests/ -v
+```
 
-**Windows (Task Scheduler):**
-- Open Task Scheduler → Create Basic Task
+### Automate daily (Windows Task Scheduler)
 - Trigger: Daily at 7:00 AM
-- Action: Start a program → `python.exe`
-- Arguments: `C:\path\to\india_security_news.py`
+- Program: `python.exe`
+- Arguments: `C:\path\to\news-agent\main.py`
+- Start in: `C:\path\to\news-agent\`
 
 ---
 
 ## Pipeline Steps
 
 ```
-[1/5] Fetch RSS articles        → fetch_rss_articles()
-[2/5] Fetch NewsAPI articles    → fetch_newsapi_articles()
-[3/5] Draft summary             → summarize_with_claude()   [Claude analyst pass]
-[4/5] Review + key developments → review_with_claude()      [Claude editor pass]
-[5/5] Build PDF                 → generate_pdf()
+[1/5] Fetch RSS articles         → fetch_rss_articles(seen_titles)
+[2/5] Fetch NewsAPI articles     → fetch_newsapi_articles(seen_titles)
+[3/5] Draft summary              → summarize_with_gemini(articles, deadline)
+[4/5] Review + key developments  → review_with_gemini(draft, articles, deadline)
+[5/5] Build PDF                  → generate_pdf(summary, key_devs, sources, count)
 ```
 
 ---
 
-## Common Customizations
+## Common Customisations
 
 ### Change output folder
-```python
-OUTPUT_DIR = "C:/Users/yourname/SecurityReports"
+Set in `.env`:
+```
+OUTPUT_DIR=C:/Users/yourname/SecurityReports
 ```
 
 ### Add more RSS sources
+In `config.py`:
 ```python
-RSS_FEEDS["NDTV Security"] = "https://feeds.ndtv.com/ndtv/national?pfrom=home-ndtvrss"
-RSS_FEEDS["Indian Express"] = "https://indianexpress.com/section/india/feed/"
+RSS_FEEDS["Dawn Pakistan"] = "https://www.dawn.com/feeds/home"
 ```
 
-### Focus on a specific threat type (e.g. cyber only)
-Add to `SECURITY_KEYWORDS`:
+### Focus on a specific threat type
+Add to `SECURITY_KEYWORDS` in `config.py`:
 ```python
-"India cyber threat 2026",
 "India data breach",
 "India critical infrastructure attack",
 ```
 
+### Raise the article corpus cap
+In `config.py`:
+```python
+MAX_CORPUS_ARTICLES = 80
+```
+
 ### Add email delivery
-Use Python's `smtplib` to attach and send the PDF after `generate_pdf()`.
-Ask Claude: *"Add Gmail email delivery to the india_security_news.py script"*
+Use Python's `smtplib` to attach and send the PDF after `generate_pdf()` returns.
 
 ---
 
 ## Dependencies
 
-| Library          | Purpose                        | Install                        |
-|------------------|--------------------------------|--------------------------------|
-| `feedparser`     | Parse RSS/Atom feeds           | `pip install feedparser`       |
-| `requests`       | HTTP calls to NewsAPI          | `pip install requests`         |
-| `anthropic`      | Claude AI summarization+review | `pip install anthropic`        |
-| `reportlab`      | PDF generation                 | `pip install reportlab`        |
-| `newsapi-python` | NewsAPI client (optional)      | `pip install newsapi-python`   |
+| Library | Purpose |
+|---------|---------|
+| `feedparser` | Parse RSS/Atom feeds |
+| `requests` | HTTP calls to RSS feeds and NewsAPI |
+| `google-genai` | Google Gemini AI summarisation + review |
+| `reportlab` | A4 PDF generation |
+| `newsapi-python` | NewsAPI REST client |
+| `python-dotenv` | Load `.env` secrets at startup |
+| `pytest` | Unit and integration tests |
 
 ---
 
@@ -239,12 +280,13 @@ Ask Claude: *"Add Gmail email delivery to the india_security_news.py script"*
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `0 articles found` | Too-strict filter or internet issue | Lower threshold to `2` in `is_security_relevant()` |
-| NewsAPI skipped | Key not set | Register at newsapi.org and add key to `NEWSAPI_KEY` |
-| `ANTHROPIC_API_KEY not set` | Missing key | Set `ANTHROPIC_API_KEY` env var or paste into `ANTHROPIC_KEY` |
-| PDF not saving | Wrong `OUTPUT_DIR` | Use absolute path or `"."` for current folder |
-| Summary too short | Few articles fetched | Add more RSS feeds or broaden keywords |
-| Claude call fails | API quota or network | Check Anthropic dashboard for usage/errors |
+| `0 articles found` | Strict filter or network issue | Lower threshold in `is_security_relevant()` to `>= 2` |
+| NewsAPI skipped | Key not set | Add `NEWSAPI_KEY` to `.env` |
+| `GEMINI_API_KEY is not set` | Missing `.env` | Create `.env` with a valid Gemini key |
+| `403 PERMISSION_DENIED / leaked` | Key was exposed in git history | Generate a new key at aistudio.google.com |
+| `Gemini deadline exceeded` | Slow network or heavy rate-limiting | Increase `GEMINI_DEADLINE_SECS` in `config.py` |
+| `RESOURCE_EXHAUSTED` | Free tier daily quota | Wait until midnight (Pacific) or use a new key |
+| PDF not saving | Wrong `OUTPUT_DIR` | Set to absolute path in `.env` |
 
 ---
 
