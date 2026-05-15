@@ -1,0 +1,18 @@
+# Generated PDF reports
+*.pdf
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environment
+.env
+.venv
+venv/
+
+# Logs
+*.log
+log/

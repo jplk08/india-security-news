@@ -1,0 +1,5 @@
+feedparser
+requests
+reportlab
+google-generativeai
+newsapi-python
